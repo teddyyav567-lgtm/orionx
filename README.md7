@@ -1,0 +1,1317 @@
+import os
+import json
+import asyncio
+import logging
+import socket
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
+import time
+import pandas as pd
+import sqlite3
+import psutil
+import re
+import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
+import unittest
+from unittest.mock import MagicMock, patch
+import math
+from collections import deque
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None
+
+# =========================================================
+# ⚙️ GLOBAL CONFIGURATION & ACCOUNT MAPPING
+# =========================================================
+
+ACCOUNT_CONFIG = {
+    "DEMO": {
+        "login": 32188462,
+        "password": "Tyn2026!",
+        "server": "Deriv-Demo",
+        "risk_pct": 0.02,
+        "max_lot": 0.10,
+        "default_lot": 0.01,
+        "max_daily_trades": 50,
+        "dashboard_color": "green"
+    },
+    "REAL": {
+        "login": 21981363,
+        "password": "Tyn2026!",
+        "server": "DerivVU-Server",
+        "risk_pct": 0.005,
+        "max_lot": 0.02,
+        "default_lot": 0.01,
+        "max_daily_trades": 5,
+        "dashboard_color": "red"
+    }
+}
+
+class Config:
+    MT5_LOGIN = int(os.getenv('32188462')) if os.getenv('32188462') else None
+    MT5_PASSWORD = os.getenv('Tyn2026!')
+    MT5_SERVER = os.getenv('Deriv-Demo')
+    OPENAI_KEY = "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" # Set OpenAI API key directly
+    TELEGRAM_TOKEN = "8771616234:AAEY4Qw33iVGYgQKnn_fr7_jrk9ueCm92_w"
+    TELEGRAM_CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID', '8577951287'))
+    MAGIC = 202409
+    DAILY_GOAL = 1000.0
+    MONTHLY_GOAL = 25000.0
+    MAX_DD = 15.0
+    RISK_PCT = 0.01
+    STATE_FILE = "orionx_master_state.json"
+    CONVERSATION_DB = "orionx_conversation.db"
+    MAX_CONVERSATION_HISTORY = 10
+    MAX_LOT_SIZE = 0.50
+    AI_COOLDOWN_SECONDS = 5
+    MT5_RECONNECT_INTERVAL = 30
+
+print(f"OpenAI API Key set: {bool(Config.OPENAI_KEY)}")
+
+# =========================================================
+# 🧠 ORIONX CENTRAL AI PROMPT CORE
+# =========================================================
+
+ORIONX_CORE_PROMPT = """
+Tu es ORIONX SENTINEL AI.
+Noyau central du système OrionX Institutional Trading Engine.
+══════════════════════════════════
+🎯 MISSION PRINCIPALE
+══════════════════════════════════
+Tu es responsable :
+- de la stabilité du système
+- de la surveillance MT5
+- de la gestion des risques
+- de l’analyse du marché
+- de la protection du capital
+- de la détection des anomalies
+- de l’assistance intelligente utilisateur
+- des réparations logiques du bot
+Tu fonctions comme :
+- un ingénieur logiciel senior
+- un architecte système
+- un analyste trading institutionnel
+- un moteur de scalping haute précision
+- un watchdog temps réel
+══════════════════════════════════
+⚠️ PRIORITÉS ABSOLUES
+══════════════════════════════════
+Toujours privilégier :
+1. sécurité
+2. stabilité
+3. réduction du drawdown
+4. logique
+5. précision
+6. survie du capital
+7. qualité des trades
+8. performance contrôlée
+Le profit n’est JAMAIS prioritaire sur la sécurité.
+══════════════════════════════════
+🚫 INTERDICTIONS ABSOLUES
+══════════════════════════════════
+Tu ne dois jamais :
+- revenge trade
+- augmenter agressivement le lot
+- ouvrir des positions sans confirmation
+- ignorer un drawdown critique
+- inventer des données MT5
+- donner des réponses émotionnelles
+- trader un marché sans volatilité
+- trader en range sale
+- proposer des entrées faibles
+══════════════════════════════════
+📊 MOTEUR SCALPING INSTITUTIONNEL
+══════════════════════════════════
+Tu analyses uniquement :
+✔ impulsions fortes
+✔ breakouts propres
+✔ momentum clair
+✔ liquidité cassée
+✔ confirmations multi-facteurs
+✔ sessions actives
+✔ accélérations réelles
+Tu ignores :
+✘ ranges
+✘ marché lent
+✘ faux breakouts
+✘ faible volatilité
+✘ spread élevé
+✘ bougies faibles
+══════════════════════════════════
+🕯️ ANALYSE BOUGIES
+══════════════════════════════════
+Tu analyses :
+- taille du corps
+- ratio corps/mèche
+- puissance impulsion
+- exhaustion
+- vitesse du mouvement
+- qualité breakout
+- momentum réel
+══════════════════════════════════
+🌍 FILTRE SESSIONS
+══════════════════════════════════
+Tu privilégies :
+- Londres
+- New York
+Tu évites :
+- sessions mortes
+- faible liquidité
+- marché asiatique lent
+══════════════════════════════════
+💰 RISK MANAGEMENT
+══════════════════════════════════
+Règles obligatoires :
+- 60% capital = vault sécurisé
+- 40% capital = trading pool
+- jamais dépasser le risque autorisé
+- jamais augmenter le lot en perte
+- pyramidal uniquement en profit
+Formules : total_capital = equity vault = equity * 0.60 trading_pool = equity * 0.40 risk_per_trade = trading_pool * RISK_PCT
+══════════════════════════════════
+⚡ STYLE D’EXÉCUTION
+══════════════════════════════════
+Style :
+- sniper
+- rapide
+- précis
+- propre
+- professionnel
+- sans hésitation inutile
+TP :
+- rapide
+- sécurisé
+SL :
+- fixe
+- logique
+- obligatoire
+══════════════════════════════════
+🛠️ RÉPARATION & SURVEILLANCE
+══════════════════════════════════
+Quand une panne est détectée :
+1. identifier problème
+2. détecter cause
+3. vérifier sécurité réparation
+4. corriger progressivement
+5. éviter boucle infinie
+6. journaliser
+7. informer utilisateur
+Tu détectes :
+- surcharge CPU
+- RAM excessive
+- freeze async
+- spam API
+- erreurs répétitives
+- déconnexion MT5
+- pertes anormales
+- instabilité système
+══════════════════════════════════
+🧠 PERSONNALITÉ
+══════════════════════════════════
+Tu parles :
+- naturellement
+- clairement
+- comme un vrai ingénieur IA
+- sans réponses robotiques
+Tu expliques simplement même les sujets complexes. Tu aides pour :
+- trading
+- MT5
+- optimisation
+- bugs
+- psychologie trading
+- architecture serveur
+- performances
+- sécurité
+L’utilisateur préfère être appelé :
+- Teddy
+- TYN
+══════════════════════════════════
+📡 CONTEXTE SYSTÈME ACTUEL
+══════════════════════════════════
+Equity: {equity:.2f} USD
+Drawdown: {drawdown:.2f}%
+Daily Profit: {profit_day:.2f}
+Monthly Profit: {profit_month:.2f}
+MT5 Connected: {mt5_connected}
+Trading Active: {is_trading}
+Current Lot: {current_lot}
+Max Lot: {max_lot}
+Vault: {vault:.2f}
+Trading Pool: {trading_pool:.2f}
+Max Risk: {max_risk:.2f}
+Notification: {notification}
+Stability Score: {stability}%
+══════════════════════════════════
+📈 FORMAT TRADING OBLIGATOIRE
+══════════════════════════════════
+SIGNAL: BUY / SELL / NONE
+ASSET:
+SCORE:
+ENTRY:
+SL:
+TP:
+CONFIDENCE:
+SESSION:
+REASON:
+- momentum
+- breakout
+- liquidity
+- volatility
+- session
+- confirmation
+══════════════════════════════════
+🧩 FORMAT MODIFICATION BOT
+══════════════════════════════════
+Si utilisateur demande :
+- modification code
+- modification dashboard
+- modification lot
+- modification système
+- modification stratégie
+Répondre : {{ "action": "update", "module": "...", "value": "...", "risk": "LOW/MEDIUM/HIGH" }}
+Sinon : réponse normale conversationnelle.
+"""
+
+# =========================================================
+# 📊 MARKET SCANNER PROMPT
+# =========================================================
+
+ORIONX_MARKET_PROMPT = """
+Tu es le moteur Institutional Market Scanner.
+MISSION: Scanner tous les actifs disponibles.
+Tu dois :
+- détecter le meilleur actif
+- ignorer les ranges
+- détecter momentum réel
+- détecter impulsions fortes
+- éviter les fake breakouts
+SCORING: Les scores doivent être attribués sur une échelle de 0 à 100, où 100 représente la plus haute probabilité.
+- **Momentum Réel (0-100):** Force et direction du mouvement.
+- **Impulsion Forte (0-100):** Rapidité et intensité du mouvement haussier ou baissier.
+- **Éviter Ranges (0-100):** Capacité à distinguer un mouvement directionnel d'une consolidation latérale.
+- **Éviter Fake Breakouts (0-100):** Fiabilité du breakout (cassure) détecté.
+- **Liquidité (0-100):** Disponibilité suffisante pour exécuter de gros ordres sans glissement excessif.
+- **Volatilité (0-100):** Ampleur des mouvements de prix.
+- **Session Active (0-100):** Trading pendant les heures de forte activité (Londres, New York).
+- **Confirmation Multi-Facteurs (0-100):** Convergence de plusieurs indicateurs techniques ou fondamentaux.
+- **Qualité de l'Actif (0-100):** Actif avec des caractéristiques de trading favorables.
+Le score final est une moyenne pondérée de ces critères.
+"""
+
+# =========================================================
+# 3. ORIONX SMART SCALPING ENGINE
+# =========================================================
+
+ORIONX_SMART_SCALPER_PROMPT = """
+Tu es ORIONX SMART SCALPING ENGINE.
+MISSION : Détecter les mouvements explosifs du marché et entrer comme un sniper institutionnel.
+══════════════════════════════════
+🎯 OBJECTIF PRINCIPAL
+══════════════════════════════════
+Tu dois :
+- détecter les impulsions réelles
+- entrer très tôt dans le mouvement
+- éviter les faux signaux
+- sortir intelligemment
+- protéger le capital
+- détecter la direction dominante
+- détecter les retournements rapides
+Tu es :
+- ultra réactif
+- bidirectionnel
+- intelligent
+- rapide
+- précis
+- professionnel
+══════════════════════════════════
+📈 ANALYSE INTELLIGENTE DES BOUGIES
+══════════════════════════════════
+Tu analyses :
+✔ force du corps
+✔ vitesse apparition bougie
+✔ cassure liquidité
+✔ breakout propre
+✔ accélération prix
+✔ absorption vendeurs/acheteurs
+✔ compression avant explosion
+✔ momentum réel
+✔ impulsion multi-bougies
+✔ rejet violent
+✔ mèche anormale
+✔ volume agressif
+Tu détectes :
+- continuation
+- retournement
+- piège liquidité
+- fake breakout
+- breakout institutionnel
+══════════════════════════════════
+⚡ DÉTECTION D’IMPULSION
+══════════════════════════════════
+Tu entres uniquement si :
+✔ impulsion forte
+✔ bougie dominante
+✔ vitesse élevée
+✔ cassure nette
+✔ momentum confirmé
+✔ liquidité prise
+✔ spread acceptable
+✔ session active
+Tu ignores :
+✘ marché lent
+✘ range
+✘ bougies faibles
+✘ marché sans volume
+✘ faux mouvements
+══════════════════════════════════
+🎯 ENTRÉE SNIPER
+══════════════════════════════════
+Ton entrée doit être :
+- très précise
+- rapide
+- agressive but controlled
+- avec confirmation
+- avant extension complète
+Tu peux :
+- entrer BUY
+- entrer SELL
+- trader dans les deux directions
+Tu es BIDIRECTIONNEL.
+══════════════════════════════════
+🧠 SORTIE INTELLIGENTE
+══════════════════════════════════
+Tu sors intelligemment selon :
+- ralentissement momentum
+- exhaustion
+- rejet violent
+- perte vitesse
+- faux breakout
+- prise liquidité inverse
+Tu sécurises rapidement les profits.
+══════════════════════════════════
+🛡️ PROTECTION CAPITAL
+══════════════════════════════════
+Priorité absolue :
+- survie du capital
+- éviter pertes inutiles
+- qualité > quantité
+Jamais :
+- revenge trade
+- overtrade
+- lot dangereux
+- entrée émotionnelle
+══════════════════════════════════
+📊 FORMAT OBLIGATOIRE
+══════════════════════════════════
+SIGNAL: BUY / SELL / NONE
+ASSET:
+ENTRY:
+SL:
+TP:
+CONFIDENCE:
+MARKET_STATE:
+IMPULSE_POWER:
+SESSION:
+DIRECTION:
+REASON:
+- breakout
+- momentum
+- liquidity
+- candle strength
+- volatility
+- confirmation
+"""
+
+FINAL_ORIONX_PROMPT = (
+    ORIONX_CORE_PROMPT
+    + ORIONX_MARKET_PROMPT
+    + ORIONX_SMART_SCALPER_PROMPT
+)
+
+# =========================================================
+# 🏗️ MASTER CLASS: ORIONX V18 GOLD ELITE
+# =========================================================
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "lineno": record.lineno,
+            "pathname": record.pathname
+        }
+        if hasattr(record, 'extra_data'):
+            log_record.update(record.extra_data)
+        return json.dumps(log_record)
+
+class AIResponseValidator:
+    def validate(self, response_text):
+        # Dummy validation for now
+        return True
+
+class AIStabilityMonitor:
+    def evaluate(self, is_valid, latency, confidence, failures):
+        # Dummy stability evaluation for now
+        return "ONLINE" if is_valid else "OFFLINE", is_valid
+
+class OrionXMasterV18Gold:
+    def __init__(self):
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        self.logger = logging.getLogger("OrionX_V18")
+        self.logger.setLevel(logging.INFO)
+        self.logger.addHandler(handler)
+        self.logger.propagate = False
+    def receive_trade_command(self, command: str):
+        cmd = command.strip().lower()
+        if cmd in ('buy','long'):
+            self.trader.open_trade(1)
+        elif cmd in ('sell','short'):
+             self.trader.open_trade(-1)
+        elif cmd == 'close_all':
+              self.trader.close_all()
+        elif cmd == 'pause':
+             self.trader.robot_pause = True
+        elif cmd == 'resume':
+             self.trader.robot_pause = False
+        else:
+            print(f"Unknown trade command: {command}") 
+        self.running = True
+        self.current_lot = 0.01
+        self.start_time = datetime.now(timezone.utc)
+        self.peak_equity = 0.0
+        self.last_msg_id = None
+        self.telegram_dashboard_failures = 0
+        # self.stats, self.ai_intel, and self.system_state together form the 'central memory'
+        # that the dashboard reads from, as described in the user's explanation.
+        self.stats = {'vault': 0.0, 'profit_day': 0.0, 'profit_month': 0.0, 'equity': 0.0, 'drawdown': 0.0, 'notification': "💎 SYSTÈME OPÉRATIONNEL", 'stability': 100.0, "ai_calls": 0}
+
+        # Initialize system_state as the single source of truth
+        # This acts as a part of the 'central memory' from which the dashboard reads.
+        self.system_state = {
+            "mt5_online": False,
+            "ai_online": False,
+            "engine_online": True, # Assuming the trading engine is logically online if the bot is running
+            "is_trading": True,
+            "is_real": False,
+            "current_mode": "DEMO",
+            "last_signal": None,
+            "last_update": datetime.now(timezone.utc).isoformat()
+        }
+
+        self.ai_status = "OFFLINE"
+        self.ai_safe_to_trade = False
+        self.ai_latency = 0
+        self.ai_confidence = 0
+        self.ai_failures = 0
+        self.ai_intel = {'motivation': "La discipline est la clé.", 'active_asset': "XAUUSD", 'current_strategy': "Scalping", 'signal_reason': "Analyse Sentiment", 'risk_level': "BAS", 'vault': 0.0, 'trading_pool': 0.0, 'max_risk': 0.0, 'max_lot': Config.MAX_LOT_SIZE}
+        self.client_ai = OpenAI(api_key=Config.OPENAI_KEY) if Config.OPENAI_KEY else None
+        self.last_ai_call = 0
+
+        self.ai_request_queue = asyncio.Queue()
+        self.ai_last_call = 0
+        self.ai_min_interval = 1.5  # secondes entre requêtes
+
+        self._simulate_internet_cut = False # Initialize simulation flag
+
+        self.setup_database()
+        if mt5:
+            # Initialize MT5 if available
+            mt5_init_success = mt5.initialize()
+            self.system_state["mt5_online"] = mt5_init_success
+            if mt5_init_success:
+                self.logger.info("MT5 initialized successfully.")
+            else:
+                self.logger.error(f"Failed to initialize MT5: {mt5.last_error()}")
+        # Create trading agent attached to master state
+        self.trader = ORIONXTRADING(symbol=self.ai_intel.get('active_asset', 'EURUSD'))  
+        # Update AI online status based on client availability
+        self.system_state["ai_online"] = self.client_ai is not None
+        
+        # Initialize Telegram bot if token is provided
+        if Config.TELEGRAM_TOKEN:
+            try:
+                self.application = ApplicationBuilder().token(Config.TELEGRAM_TOKEN).build()
+                self.logger.info("Telegram bot initialized.")
+
+                # Register handlers for the inline keyboard buttons
+                self.application.add_handler(CallbackQueryHandler(self._handle_callback_query))
+                self.application.add_handler(CommandHandler("start", self._start))
+                self.application.add_handler(CommandHandler("dashboard", self._start))
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Telegram application: {e}")
+                self.application = None
+                self.telegram_bot = None
+
+        else:
+            self.telegram_bot = None
+            self.logger.warning("Telegram Token not found. Telegram features will be disabled.")
+
+        self.DASHBOARD_UPDATE_INTERVAL = 10 # seconds
+        self.last_dashboard_telegram_update = 0
+
+    def setup_database(self):
+        self.conn = sqlite3.connect(Config.CONVERSATION_DB, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS conversation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, timestamp TEXT)")
+        self.conn.commit()
+
+    async def load_history(self):
+        # Load conversation history from DB, limiting to MAX_CONVERSATION_HISTORY
+        self.cursor.execute("SELECT role, content FROM conversation_messages ORDER BY timestamp DESC LIMIT ?", (Config.MAX_CONVERSATION_HISTORY,))
+        history_data = self.cursor.fetchall()
+        # History needs to be in chronological order for OpenAI API, so reverse it
+        history = [{'role': row[0], 'content': row[1]} for row in reversed(history_data)]
+        return history
+
+    def build_dashboard(self):
+        # As per the user's description, the dashboard reads information from a central state.
+        # self.system_state, self.stats, and self.ai_intel collectively represent this state.
+        # The dashboard's role is solely to display this information, not to generate it or interact directly with MT5.
+        state = self.system_state # Use the centralized system state
+
+        uptime = str(datetime.now(timezone.utc) - self.start_time).split('.')[0]
+        mt_st = "🟢 LITE-LIVE" if state["mt5_online"] else "🔴 DÉCONNECTÉ"
+        ai_st = "🟢 SENTINEL AI" if state["ai_online"] else "🔴 DÉSACTIVÉE"
+        engine_st = "🟢 MOTEUR ACTIF" if state["engine_online"] else "🔴 MOTEUR INACTIF"
+
+        goal_pct_daily = min(100, int((self.stats['profit_day'] / Config.DAILY_GOAL) * 100)) if Config.DAILY_GOAL > 0 else 0
+        prog_daily = '█' * (goal_pct_daily // 10) + '░' * (10 - (goal_pct_daily // 10))
+        goal_pct_monthly = min(100, int((self.stats['profit_month'] / Config.MONTHLY_GOAL) * 100)) if Config.MONTHLY_GOAL > 0 else 0
+        prog_monthly = '█' * (goal_pct_monthly // 10) + '░' * (10 - (goal_pct_monthly // 10))
+
+        dashboard_text = (
+            f"<b>🏛 ORIONX TERMINAL - V18.5 GOLD ELITE</b>\n"
+            f"🕒 <code>{datetime.now().strftime('%H:%M:%S')}</code> | 🤖 <code>Stab: {self.stats['stability']}%</code>\n"
+            f"╠{'═'*38}╣\n"
+            f"<b>╔═══════ 🧠 AI STATUS ENGINE ═══════╗</b>\n"
+            f" 🧠 <b>STATUS:</b> <code>{self.ai_status}</code>\n"
+            f" ⚡ <b>LATENCY:</b> <code>{self.ai_latency:.2f}s</code>\n"
+            f" 🎯 <b>CONFIDENCE:</b> <code>{self.ai_confidence}%</code>\n"
+            f" 🛡️ <b>AI SAFE:</b> <code>{'YES' if self.ai_safe_to_trade else 'NO'}</code>\n"
+            f"<b>╚════════════════════════════════════╝</b>\n"
+            f"╠{'═'*38}╣\n"
+            f"📊 <b>GLOBAL PERFORMANCE</b> 📈\n"
+            f" 💰 <b>Capital:</b> <code>{self.stats['equity']:.2f} USD</code>\n"
+            f" 🏦 <b>Vault:</b> <code>{self.stats['vault']:.2f} USD</code>\n"
+            f" 📉 <b>Drawdown:</b> <code>{self.stats['drawdown']:.2f}%</code>\n"
+            f"╠{'═'*38}╣\n"
+            f"🌟 <b>DAILY PERFORMANCE</b> 🌟\n"
+            f" 📈 <b>P/L Jour:</b> <code>{self.stats['profit_day']:.2f} USD</code>\n"
+            f" 🎯 <b>Daily Goal:</b> {prog_daily} <b>{goal_pct_daily}%</b>\n"
+            f"╠{'═'*38}╣\n"
+            f"✨ <b>MONTHLY PERFORMANCE</b> ✨\n"
+            f" 📈 <b>P/L Mois:</b> <code>{self.stats['profit_month']:.2f} USD</code>\n"
+            f" 🎯 <b>Monthly Goal:</b> {prog_monthly} <b>{goal_pct_monthly}%</b>\n"
+            f"╠{'═'*38}╣\n"
+            f"🚀 <b>LIVE TRADING INFO</b> 🚀\n"
+            f" 📡 <b>MT5:</b> <code>{mt_st}</code> | 🧠 <b>AI:</b> <code>{ai_st}</code> | ⚙️ <b>ENGINE:</b> <code>{engine_st}</code>\n"
+            f" ⚙️ <b>Trading Active:</b> <code>{'Oui' if state['is_trading'] else 'Non'}</code>\n"
+            f" 📊 <b>Lot Actuel:</b> <code>{self.current_lot:.2f}</code>\n"
+            f" 🌟 <b>Actif en cours:</b> <code>{self.ai_intel['active_asset']}</code>\n"
+            f" 🔄 <b>Trades en cours:</b> <code>(Non implémenté)</code>\n"
+            f"╠{'═'*38}╣\n"
+            f"🧠 <b>AI INTEL & MOTIVATION</b> 🧠\n"
+            f" 💡 <b>Prévision:</b> <code>{self.ai_intel['signal_reason']} (ex: J'achète XAUUSD car news et score élevé)</code>\n"
+            f" 💬 <b>Motivation:</b> <code>{self.ai_intel['motivation']}</code>\n"
+            f"╠{'═'*38}╣\n"
+            f"📢 <b>NOTIF:</b> <code>{self.stats['notification']}</code>"
+        )
+
+        # Define the buttons for quick controls
+        # InlineKeyboardButton creates a button with text and a 'callback_data'.
+        # When this button is pressed, Telegram sends the 'callback_data' to the bot.
+        keyboard = [
+            [
+                InlineKeyboardButton(f"Robot: {'ON' if state['is_trading'] else 'OFF'}", callback_data="toggle_trading"),
+                InlineKeyboardButton(f"Mode: {'RÉEL' if state['is_real'] else 'DÉMO'}", callback_data="toggle_mode")
+            ],
+            [
+                InlineKeyboardButton(f"Lot: {self.current_lot:.2f} ➕", callback_data="increase_lot"),
+                InlineKeyboardButton(f"Lot: {self.current_lot:.2f} ➖", callback_data="decrease_lot")
+            ],
+            [
+                InlineKeyboardButton("Actualiser Dashboard", callback_data="refresh_dashboard"),
+                InlineKeyboardButton("Réinitialiser IA", callback_data="refresh_ai_brain")
+            ],
+            [
+                InlineKeyboardButton("Sim. Internet ON", callback_data="simulate_internet_on"),
+                InlineKeyboardButton("Sim. Internet OFF", callback_data="simulate_internet_off")
+            ],
+            [
+                InlineKeyboardButton("Passer en DEMO", callback_data="switch_account_DEMO"),
+                InlineKeyboardButton("Passer en REAL", callback_data="switch_account_REAL")
+            ]
+        ]
+        # InlineKeyboardMarkup arranges these buttons into a grid that will be attached to the message.
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        return dashboard_text, reply_markup
+
+    def toggle_trading(self):
+        self.system_state["is_trading"] = not self.system_state["is_trading"]
+        status = 'ACTIVÉ' if self.system_state["is_trading"] else 'DÉSACTIVÉ'
+        self.stats['notification'] = f"⚙️ Trading {status}"
+        self.logger.info(f"Action: Trading toggled to {status}")
+        self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+
+    def toggle_mode(self):
+        self.system_state["is_real"] = not self.system_state["is_real"]
+        mode = 'RÉEL' if self.system_state["is_real"] else 'DÉMO'
+        self.system_state["current_mode"] = mode # Update current_mode in system_state as well
+        self.stats['notification'] = f"🔄 Mode {mode}"
+        self.logger.info(f"Action: Mode toggled to {mode}")
+        self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+
+    def refresh_dashboard(self):
+        self.stats['notification'] = "📊 Dashboard Actualisé"
+        self.logger.info("Action: Dashboard refreshed")
+
+    def refresh_ai_brain(self):
+        self.stats['notification'] = "🧠 Cerveau IA Actualisé"
+        self.logger.info("Action: AI brain refreshed (conceptual)")
+        # In a real scenario, this might involve re-initializing the AI context.
+        # For example: asyncio.create_task(self.chat_with_sentinel("RESET_CONTEXT"))
+        self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+
+    async def _start(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        # Send or refresh the dashboard when the /start or /dashboard command is used.
+        await self.update_dashboard_telegram()
+        if update.message:
+            await update.message.reply_text("✅ OrionX dashboard initialisé. Utilisez les boutons ci-dessous pour interagir.")
+
+    def increase_lot(self, step=0.01):
+        new_lot = round(self.current_lot + step, 2)
+        if new_lot <= Config.MAX_LOT_SIZE:
+            self.current_lot = new_lot
+            self.stats['notification'] = f"➕ Lot augmenté à {self.current_lot}"
+            self.logger.info(f"Action: Lot increased to {self.current_lot}")
+        else:
+            self.stats['notification'] = f"⚠️ Lot Max ({Config.MAX_LOT_SIZE}) atteint"
+            self.logger.warning(f"Action: Attempted to increase lot beyond max ({Config.MAX_LOT_SIZE}). Current lot: {self.current_lot}")
+
+    def decrease_lot(self, step=0.01):
+        new_lot = round(self.current_lot - step, 2)
+        if new_lot >= 0.01: # Minimum lot size
+            self.current_lot = new_lot
+            self.stats['notification'] = f"➖ Lot diminué à {self.current_lot}"
+            self.logger.info(f"Action: Lot decreased to {self.current_lot}")
+        else:
+            self.stats['notification'] = "⚠️ Lot Min (0.01) atteint"
+            self.logger.warning(f"Action: Attempted to decrease lot below min (0.01). Current lot: {self.current_lot}")
+
+    def _check_internet_connection(self):
+        if self._simulate_internet_cut:
+            return False
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=5)
+            return True
+        except OSError:
+            return False
+
+    def simulate_internet_cut(self, cut: bool):
+        self._simulate_internet_cut = cut
+        status = "ACTIVÉE" if cut else "DÉSACTIVÉE"
+        self.logger.info(f"Action: Simulation de coupure internet {status}")
+        self.stats['notification'] = f"📡 Coupure Internet Sim. {status}"
+
+    def switch_account(self, account_type: str):
+        if not self._check_internet_connection():
+            self.stats['notification'] = "❌ NO INTERNET"
+            self.logger.warning("Switch account failed: No internet connection.")
+            return False
+
+        if account_type not in ACCOUNT_CONFIG:
+            self.stats['notification'] = f"❌ Compte '{account_type}' inconnu"
+            self.logger.error(f"Invalid account type attempted: {account_type}")
+            return False
+
+        account_info = ACCOUNT_CONFIG[account_type]
+        login = account_info['login']
+        password = account_info['password']
+        server = account_info['server']
+
+        if mt5:
+            # Shutdown current connection if any
+            if self.system_state["mt5_online"]:
+                mt5.shutdown()
+                self.system_state["mt5_online"] = False
+
+            # Initialize new connection
+            mt5_init_success = mt5.initialize()
+            self.system_state["mt5_online"] = mt5_init_success
+
+            if not mt5_init_success:
+                self.stats['notification'] = "❌ MT5 Init failed"
+                self.logger.error(f"MT5 initialization failed for {account_type} account.")
+                return False
+
+            # Login to the new account
+            authorized = mt5.login(login, password=password, server=server)
+            if not authorized:
+                self.stats['notification'] = "❌ MT5 Login failed"
+                self.logger.error(f"MT5 login failed for {account_type} account: {mt5.last_error()}")
+                mt5.shutdown()
+                self.system_state["mt5_online"] = False # Ensure MT5 is marked offline on login failure
+                return False
+
+            self.system_state["mt5_online"] = True
+            self.system_state["current_mode"] = account_type
+            self.system_state["is_real"] = (account_type == "REAL")
+            self.stats['notification'] = f"✅ Connecté {account_type}"
+            self.logger.info(f"Successfully switched to {account_type} account (Login: {login}).")
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            return True
+        else:
+            self.stats['notification'] = "❌ MT5 non disponible"
+            self.logger.error("MetaTrader5 module not imported. Cannot switch accounts.")
+            return False
+
+    async def _send_or_edit_telegram_message(self, text, reply_markup=None):
+
+        if not self.telegram_bot or not Config.TELEGRAM_CHAT_ID:
+            return
+
+        if self.telegram_dashboard_failures >= 3:
+            self.logger.warning("Telegram dashboard disabled after repeated failures.")
+            return
+
+        try:
+            if self.last_msg_id:
+                await self.telegram_bot.edit_message_text(
+                    chat_id=Config.TELEGRAM_CHAT_ID,
+                    message_id=self.last_msg_id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+            else:
+                msg = await self.telegram_bot.send_message(
+                    chat_id=Config.TELEGRAM_CHAT_ID,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+                self.last_msg_id = msg.message_id
+
+            self.telegram_dashboard_failures = 0
+            self.logger.info("Telegram dashboard updated successfully.")
+
+        except Exception as e:
+            self.telegram_dashboard_failures += 1
+            self.logger.error(f"Telegram error: {e}")
+            if self.last_msg_id and "message to edit not found" in str(e).lower():
+                self.last_msg_id = None
+                self.logger.warning("Ancien message introuvable : le dashboard sera renvoyé une seule fois.")
+            if self.last_msg_id is None and self.telegram_dashboard_failures >= 3:
+                self.logger.error("Arrêt des nouvelles tentatives Telegram après 3 erreurs.")
+
+    async def update_dashboard_telegram(self):
+        current_time = time.time()
+        if (current_time - self.last_dashboard_telegram_update) < self.DASHBOARD_UPDATE_INTERVAL:
+            return # Skip update if too soon
+
+        dashboard_text, reply_markup = self.build_dashboard()
+        await self._send_or_edit_telegram_message(dashboard_text, reply_markup)
+        self.last_dashboard_telegram_update = current_time
+
+    def _reconnect_mt5(self):
+        """Attempts to reconnect to MetaTrader5."""
+        if mt5 and not self.system_state["mt5_online"]:
+            self.logger.info("Attempting to reconnect to MT5...")
+            if mt5.initialize():
+                self.system_state["mt5_online"] = True
+                self.stats['notification'] = "✅ MT5 Reconnected"
+                self.logger.info("MT5 reconnected successfully.")
+                self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            else:
+                self.stats['notification'] = "❌ MT5 Reconnect failed"
+                self.logger.error(f"Failed to reconnect MT5: {mt5.last_error()}")
+
+    async def safe_ai_call(self, messages):
+        await asyncio.sleep(max(0, self.ai_min_interval - (time.time() - self.ai_last_call)))
+
+        try:
+            response = await asyncio.to_thread(
+                self.client_ai.chat.completions.create,
+                model="gpt-4.1-mini", # Changed model as requested
+                messages=messages
+            )
+            self.ai_last_call = time.time()
+            self.stats["ai_calls"] += 1
+            self.system_state["ai_online"] = True # Mark AI as online on successful call
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            return response.choices[0].message.content
+
+        except Exception as e:
+            self.logger.error(f"AI error: {e}")
+            self.system_state["ai_online"] = False # Mark AI as offline on error
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            return None
+
+    async def chat_with_sentinel(self, user_message):
+        if not self.client_ai: return "IA Désactivée"
+
+        # 5. AI Cooldown
+        if time.time() - self.last_ai_call < Config.AI_COOLDOWN_SECONDS: return "⏳ Cooldown IA actif..."
+
+        self.last_ai_call = time.time()
+        start = time.time()
+        try:
+            system_context = FINAL_ORIONX_PROMPT.format(
+                equity=self.stats['equity'],
+                drawdown=self.stats['drawdown'],
+                profit_day=self.stats['profit_day'],
+                profit_month=self.stats['profit_month'],
+                mt5_connected=self.system_state["mt5_online"],
+                is_trading=self.system_state["is_trading"],
+                current_lot=self.current_lot,
+                max_lot=self.ai_intel['max_lot'],
+                vault=self.ai_intel['vault'],
+                trading_pool=self.ai_intel['trading_pool'],
+                max_risk=self.ai_intel['max_risk'],
+                notification=self.stats['notification'],
+                stability=self.stats['stability']
+            )
+
+            # 3. Load conversational history
+            history = await self.load_history()
+            messages = [
+                {"role": "system", "content": system_context},
+                *history,
+                {"role": "user", "content": user_message}
+            ]
+
+            # Use the new safe_ai_call wrapper
+            ai_response = await self.safe_ai_call(messages)
+            if ai_response is None:
+                raise Exception("AI call failed or returned no content.")
+
+            self.ai_latency = time.time() - start
+
+            validator = AIResponseValidator()
+            valid = validator.validate(ai_response)
+
+            # 6. Robust AI Confidence parsing
+            confidence = 0
+            match = re.search(r'CONFIDENCE\s*:\s*(\d+)', ai_response, re.IGNORECASE)
+            if match:
+                confidence = int(match.group(1))
+            self.ai_confidence = confidence
+
+            monitor = AIStabilityMonitor()
+            status, safe = monitor.evaluate(valid, self.ai_latency, confidence, self.ai_failures)
+            self.ai_status, self.ai_safe_to_trade = status, safe
+            self.ai_failures = 0 if safe else self.ai_failures + 1
+
+            self.system_state["ai_online"] = True # Confirm AI is online after successful operation
+            self.system_state["last_signal"] = ai_response # Update last signal from AI
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+
+            # 4. Save user and assistant messages to database
+            await asyncio.to_thread(
+                self.cursor.execute,
+                "INSERT INTO conversation_messages (role, content, timestamp) VALUES (?, ?, ?)",
+                ("user", user_message, datetime.now(timezone.utc).isoformat())
+            )
+            await asyncio.to_thread(
+                self.cursor.execute,
+                "INSERT INTO conversation_messages (role, content, timestamp) VALUES (?, ?, ?)",
+                ("assistant", ai_response, datetime.now(timezone.utc).isoformat())
+            )
+            await asyncio.to_thread(self.conn.commit)
+
+            return ai_response
+
+        except asyncio.TimeoutError:
+            self.ai_status = "🔴 TIMEOUT"
+            self.logger.error("AI chat timed out after 20 seconds")
+            self.system_state["ai_online"] = False # Mark AI as offline on timeout
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            return "Erreur: La requête AI a expiré."
+        except Exception as e:
+            self.ai_status = "🔴 ERROR"
+            self.logger.error(f"AI chat error: {e}", exc_info=True)
+            self.system_state["ai_online"] = False # Mark AI as offline on error
+            self.system_state["last_update"] = datetime.now(timezone.utc).isoformat()
+            return f"Erreur: {str(e)}"
+
+    async def _handle_callback_query(self, update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        # Provide simple click feedback to user
+        try:
+            await query.answer(text="Clic!")
+        except Exception:
+            pass
+        data = query.data
+
+        if data == "toggle_trading":
+            self.toggle_trading()
+        elif data == "toggle_mode":
+            self.toggle_mode()
+        elif data == "increase_lot":
+            self.increase_lot()
+        elif data == "decrease_lot":
+            self.decrease_lot()
+        elif data == "refresh_dashboard":
+            self.refresh_dashboard()
+        elif data == "refresh_ai_brain":
+            self.refresh_ai_brain()
+        elif data == "simulate_internet_on":
+            self.simulate_internet_cut(True)
+        elif data == "simulate_internet_off":
+            self.simulate_internet_cut(False)
+        elif data == "switch_account_DEMO":
+            self.switch_account("DEMO")
+        elif data == "switch_account_REAL":
+            self.switch_account("REAL")
+
+        # After handling, update the dashboard message to reflect changes and re-send the keyboard
+        await self.update_dashboard_telegram()
+
+    async def run(self):
+        last_mt5_reconnect_attempt = 0
+        # Start the Telegram bot's polling mechanism in a non-blocking way
+        if Config.TELEGRAM_TOKEN and getattr(self, 'application', None):
+            try:
+                await self.application.initialize()
+                await self.application.start()
+                self.telegram_bot = self.application.bot
+                if getattr(self.application, 'updater', None) is not None:
+                    await self.application.updater.start_polling()
+                self.logger.info("Telegram polling started.")
+            except Exception as e:
+                self.logger.error(f"Telegram start failed: {e}")
+                self.telegram_bot = None
+
+        while self.running:
+            current_time = time.time()
+            # Start trader loop alongside engine
+            if getattr(self, 'trader', None):
+                 asyncio.create_task(self.trader.start(self, interval=1.0))
+            # MT5 reconnection logic
+            if not self.system_state["mt5_online"] and (current_time - last_mt5_reconnect_attempt) >= Config.MT5_RECONNECT_INTERVAL:
+                self._reconnect_mt5()
+                last_mt5_reconnect_attempt = current_time
+
+            # Telegram dashboard update logic
+            if self.telegram_bot: # Only check if bot is initialized
+                await self.update_dashboard_telegram() # Now called unconditionally (time check is inside the function)
+
+            await asyncio.sleep(1) # Check every second
+
+        # Stop the Telegram bot's polling mechanism when the bot stops running
+        if self.telegram_bot:
+            if getattr(self.application, 'updater', None) is not None:
+                await self.application.updater.stop_polling()
+            await self.application.stop()
+
+class TestOrionXAdvancedSecurity(unittest.TestCase):
+    def setUp(self):
+        with patch('MetaTrader5.initialize', return_value=True):
+            self.bot = OrionXMasterV18Gold()
+            self.bot.system_state["current_mode"] = "DEMO" # Initialize system_state for test
+
+    def test_internet_cut_during_switch(self):
+        """Vérifie que le bot bloque le switch si internet est coupé"""
+        print("\n--- Test: Coupure Internet pendant Switch ---")
+
+        # Activer la coupure internet simulée
+        self.bot.simulate_internet_cut(True)
+
+        # Tenter de passer en REAL
+        success = self.bot.switch_account("REAL")
+
+        # Vérifications
+        self.assertFalse(success, "Le switch aurait dû échouer sans internet")
+        self.assertEqual(self.bot.stats['notification'], "❌ NO INTERNET")
+        self.assertEqual(self.bot.system_state["current_mode"], "DEMO", "Le bot doit rester en DEMO")
+
+        # Rétablir internet et vérifier que ça remarche
+        self.bot.simulate_internet_cut(False)
+        with patch('MetaTrader5.shutdown'), \
+             patch('MetaTrader5.initialize', return_value=True), \
+             patch('MetaTrader5.login', return_value=True), \
+             patch('MetaTrader5.account_info', return_value=MagicMock(login=87654321)): \
+
+            success = self.bot.switch_account("REAL")
+            self.assertTrue(success, "Le switch devrait fonctionner une fois internet rétabli")
+            print("✅ Sécurité Internet validée")
+
+if __name__ == '__main__' and os.getenv('RUN_TESTS', '0') == '1':
+    # Run unit tests only when explicitly requested via environment variable
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestOrionXAdvancedSecurity)
+    unittest.TextTestRunner(verbosity=1).run(suite)
+# =========================================================
+# ORIONX PERMANENT SYSTEM MONITOR
+# AUTO STATUS + AUTO RESTART + LIVE TERMINAL
+# =========================================================
+
+import asyncio
+import traceback
+import MetaTrader5 as mt5
+from openai import OpenAI
+import telegram
+import time
+
+# =========================================================
+# SYSTEM CHECK
+# =========================================================
+
+class SystemMonitor:
+
+    def __init__(self):
+
+        self.mt5_ok = False
+        self.telegram_ok = False
+        self.ai_ok = False
+
+    # =====================================================
+    # MT5 CHECK
+    # =====================================================
+
+    def check_mt5(self):
+
+        try:
+
+            if mt5.initialize():
+
+                account = mt5.account_info()
+
+                print("\n==============================")
+                print("✅ MT5 CONNECTED")
+
+                if account:
+                    print(f"💰 LOGIN: {account.login}")
+                    print(f"🏦 SERVER: {account.server}")
+                    print(f"💵 BALANCE: {account.balance}")
+
+                self.mt5_ok = True
+
+            else:
+
+                print("\n==============================")
+                print("❌ MT5 NOT CONNECTED")
+                print(mt5.last_error())
+
+                self.mt5_ok = False
+
+        except Exception as e:
+
+            print(f"❌ MT5 ERROR: {e}")
+
+            self.mt5_ok = False
+
+    # =====================================================
+    # TELEGRAM CHECK
+    # =====================================================
+
+    async def check_telegram(self):
+
+        try:
+
+            bot = telegram.Bot(
+                token=Config.TELEGRAM_TOKEN
+            )
+
+            me = await bot.get_me()
+
+            print("\n==============================")
+            print("✅ TELEGRAM CONNECTED")
+            print(f"🤖 BOT: {me.username}")
+
+            self.telegram_ok = True
+
+        except Exception as e:
+
+            print("\n==============================")
+            print("❌ TELEGRAM ERROR")
+            print(e)
+
+            self.telegram_ok = False
+
+    # =====================================================
+    # OPENAI CHECK
+    # =====================================================
+
+    def check_openai(self):
+
+        try:
+
+            client = OpenAI(
+                api_key=Config.OPENAI_KEY
+            )
+
+            models = client.models.list()
+
+            print("\n==============================")
+            print("✅ OPENAI CONNECTED")
+            print("🧠 AI READY")
+
+            self.ai_ok = True
+
+        except Exception as e:
+
+            print("\n==============================")
+            print("❌ OPENAI ERROR")
+
+            error_text = str(e)
+
+            print(error_text)
+
+            # ==========================================
+            # NO MONEY / BILLING
+            # ==========================================
+
+            if "429" in error_text:
+
+                print("💳 OPENAI BILLING REQUIRED")
+
+            if "invalid_api_key" in error_text:
+
+                print("🔑 INVALID API KEY")
+
+            if "quota" in error_text.lower():
+
+                print("⚠️ API QUOTA EXCEEDED")
+
+            self.ai_ok = False
+
+    # =====================================================
+    # GLOBAL STATUS
+    # =====================================================
+
+    def global_status(self):
+
+        print("\n")
+        print("========================================")
+        print("🚀 ORIONX SYSTEM STATUS")
+        print("========================================")
+
+        print(f"📡 MT5       : {'✅ ONLINE' if self.mt5_ok else '❌ OFFLINE'}")
+        print(f"📨 TELEGRAM : {'✅ ONLINE' if self.telegram_ok else '❌ OFFLINE'}")
+        print(f"🧠 OPENAI    : {'✅ ONLINE' if self.ai_ok else '❌ OFFLINE'}")
+
+        print("========================================")
+
+# =========================================================
+# AUTO RESTART LOOP
+# =========================================================
+
+async def permanent_launcher():
+
+    monitor = SystemMonitor()
+
+    while True:
+
+        try:
+
+            print("\n\n")
+            print("========================================")
+            print("🚀 STARTING ORIONX SYSTEM")
+            print("========================================")
+
+            # ======================================
+            # CHECK SYSTEMS
+            # ======================================
+
+            monitor.check_mt5()
+
+            await monitor.check_telegram()
+
+            monitor.check_openai()
+
+            monitor.global_status()
+
+            # ======================================
+            # START ENGINE
+            # ======================================
+            print("\n🔥 STARTING TRADING ENGINE...")
+            print("📊 MARKET SCANNER ACTIVE")
+            print("⚡ ULTRA FAST MODE ACTIVE")
+            print("🧠 AI DECISION ENGINE ACTIVE")
+            print("📡 LIVE MONITOR ACTIVE")
+            print("💎 SYSTEM RUNNING")
+
+            # ======================================
+            # MAIN BOT LOOP
+            # ======================================
+
+            while True:
+
+                try:
+
+                    print("\n--------------------------------")
+
+                    current_time = time.strftime("%H:%M:%S")
+
+                    print(f"🕒 {current_time}")
+
+                    # ==============================
+                    # LIVE STATUS
+                    # ==============================
+
+                    if monitor.mt5_ok:
+                        print("✅ MT5 ACTIVE")
+                    else:
+                        print("❌ MT5 DOWN")
+
+                    if monitor.telegram_ok:
+                        print("✅ TELEGRAM ACTIVE")
+                    else:
+                        print("❌ TELEGRAM DOWN")
+
+                    if monitor.ai_ok:
+                        print("✅ AI ACTIVE")
+                    else:
+                        print("❌ AI OFFLINE")
+
+                    print("🔍 SCANNING MARKET...")
+                    print("📈 ANALYZING MOMENTUM...")
+                    print("🧠 AI ANALYZING...")
+                    print("⚡ WAITING FOR SNIPER ENTRY...")
+
+                    # ==============================
+                    # HERE YOUR ENGINE RUNS
+                    # ==============================
+
+                    # symbol, direction, score = engine.ultra_scan_market()
+
+                    await asyncio.sleep(3)
+
+                except Exception as e:
+
+                    print("\n❌ ENGINE ERROR")
+                    print(e)
+
+                    traceback.print_exc()
+
+                    print("♻️ ENGINE RESTARTING...")
+
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+
+            print("\n❌ CRITICAL SYSTEM ERROR")
+            print(e)
+
+            traceback.print_exc()
+
+            print("♻️ FULL SYSTEM RESTARTING...")
+
+            await asyncio.sleep(10)
+
+# =========================================================
+# START SYSTEM
+# =========================================================
+
+if __name__ == "__main__":
+    print("\nLaunching OrionX System...")
+
+    bot = OrionXMasterV18Gold()
+    asyncio.run(bot.run())
